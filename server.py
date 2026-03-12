@@ -68,6 +68,15 @@ except ImportError as e:
     print(f"[warn] memory/journal 不可用: {e}", file=sys.stderr)
     _MEMORY_OK = False
 
+try:
+    from screen_mcp.executor import executor, Action, Task, Level
+    from screen_mcp.planner  import planner
+    from screen_mcp.overlay  import show_insight, show_error, show_action, show_status, show_complete
+    _X_OK = True
+except ImportError as e:
+    print(f"[warn] X 模式模块不可用: {e}", file=sys.stderr)
+    _X_OK = False
+
 # ── 常量 ──────────────────────────────────────────────────────────────────────
 PLATFORM = platform.system()
 IS_MAC   = PLATFORM == "Darwin"
@@ -832,8 +841,9 @@ class ScreenBrain:
     IDLE_THR     = 5.0  # 空闲阈值（分钟）
     IDLE_CHECK   = 60   # 空闲检测间隔（秒）
 
-    # 各模式默认间隔（S 最短 = 响应最快 = 消耗最高）
-    INTERVAL = {"off": 2.0, "E": 1.5, "A": 2.0, "S": 1.0}
+    # 各模式默认间隔
+    # X 模式：0.5s 感知 + 哈希门控 Vision（不是每次都调 API）
+    INTERVAL = {"off": 2.0, "E": 1.5, "A": 2.0, "S": 1.0, "X": 0.5}
 
     def __init__(self):
         self._lock    = threading.Lock()
@@ -875,10 +885,10 @@ class ScreenBrain:
         print(f"[brain] 启动 mode={self._mode} interval={self._interval}s", file=sys.stderr)
 
     def set_mode(self, mode: str, _log: bool = True):
-        """切换模式，不重启线程。mode ∈ {off, E, A, S}"""
-        mode = mode.upper() if mode.upper() in ("E","A","S") else mode.lower()
-        if mode not in ("off","E","A","S"):
-            raise ValueError(f"未知模式: {mode}，可选: off / E / S / A")
+        """切换模式，不重启线程。mode ∈ {off, E, A, S, X}"""
+        mode = mode.upper() if mode.upper() in ("E","A","S","X") else mode.lower()
+        if mode not in ("off","E","A","S","X"):
+            raise ValueError(f"未知模式: {mode}，可选: off / E / A / S / X")
 
         prev = self._mode
         self._mode     = mode
@@ -887,12 +897,18 @@ class ScreenBrain:
         self._last_app = self._last_url = self._last_title = ""
         self._last_hash = None
 
-        # 进入 S → 启动 Thinker；离开 S → 停止 Thinker
+        # 进入 S/X → 启动 Thinker；离开 → 停止 Thinker
         if self._thinker:
-            if mode == "S" and prev != "S":
+            if mode in ("S","X") and prev not in ("S","X"):
                 self._thinker.start()
-            elif mode != "S" and prev == "S":
+            elif mode not in ("S","X") and prev in ("S","X"):
                 self._thinker.stop("模式切换")
+
+        # 进入 X → 启动 overlay 进程 + 操控模块
+        if mode == "X" and prev != "X" and _X_OK:
+            self._start_x_mode()
+        elif mode != "X" and prev == "X" and _X_OK:
+            show_status(mode)   # 更新状态条
 
         # 切到 off 或从高负载模式降级 → 立即清理截图
         if mode == "off" or (prev in ("S","A") and mode in ("E","off")):
@@ -906,6 +922,23 @@ class ScreenBrain:
 
     @property
     def running(self) -> bool: return self._running
+
+    def _start_x_mode(self):
+        """启动 X 模式：overlay 进程 + 初始化规划器"""
+        import subprocess
+        overlay_py = os.path.join(os.path.dirname(__file__), "screen_mcp", "overlay.py")
+        python     = sys.executable
+        try:
+            subprocess.Popen(
+                [python, overlay_py],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            time.sleep(0.5)   # 等 overlay 启动
+            show_status("X", "启动中")
+            planner.init()
+            print("[brain] X 模式启动：overlay + planner 已就绪", file=sys.stderr)
+        except Exception as e:
+            print(f"[brain] X 模式启动失败: {e}", file=sys.stderr)
 
     # ── 感知循环 ──────────────────────────────────────────────────────────────
 
@@ -1123,6 +1156,14 @@ class ScreenBrain:
         # 4. 通知 Thinker（自动唤醒 + 切换频率统计 + 新页面预判）
         if self._thinker:
             self._thinker.on_activity(kind=kind, url=url)
+
+        # X 模式：推送 overlay 状态更新
+        if self._mode in ("S","X") and _X_OK:
+            sess = self._session
+            pat  = snap.get("pattern","")
+            show_status(self._mode, pat, len(errs))
+            if errs:
+                show_error(errs[0][:120])
 
         print(f"[brain] #{self._event_count} {kind}|{app}|{len(text)}字|err:{len(errs)}", file=sys.stderr)
 
@@ -2011,6 +2052,84 @@ def smart_search(query: str) -> str:
         results["hint"] = "未找到相关内容，尝试换个关键词"
 
     return json.dumps(results, ensure_ascii=False, indent=2)[:8000]
+
+
+@mcp.tool()
+def run_task(description: str) -> str:
+    """
+    【X 模式专属】让 AI 直接操控鼠标键盘完成任务。
+
+    AI 会：
+    1. 截图分析当前屏幕
+    2. 规划动作序列
+    3. 根据风险等级自动执行或弹窗确认
+    4. 验证结果并报告
+
+    安全机制：
+    - 按 Esc 或把鼠标移到屏幕左上角立即停止
+    - 删除/终端命令/git push 等危险操作强制手动确认
+    - 所有操作有完整日志
+
+    示例：
+      run_task("帮我保存当前文件")
+      run_task("把第47行的 data.map 改成 data?.map")
+      run_task("运行当前文件的测试")
+
+    参数：description 用自然语言描述要做什么
+    """
+    if not _X_OK:
+        return json.dumps({"error": "X 模式未启用，需要安装 pyautogui：pip install pyautogui"})
+    if brain.mode != "X":
+        return json.dumps({"error": "请先切换到 X 模式：set_monitor_mode('X')"})
+
+    # 截图 + 上下文
+    shot = brain.latest_shot() or take_shot()
+    if not shot:
+        return json.dumps({"error": "截图失败"})
+
+    ctx  = brain.get_context_for_tool()
+    text = ctx.get("text","")[:400]
+
+    # 规划动作
+    task = planner.plan(description, shot, text)
+    if not task:
+        return json.dumps({"error": "AI 无法规划此任务，请描述更具体"})
+
+    # 注册 overlay 回调
+    t_start = time.time()
+
+    def on_preview(t, a, level):
+        show_action(t.description, a.target, level.value, t.step, len(t.actions))
+
+    def on_complete(t):
+        show_complete(t.description, t.results, time.time() - t_start)
+        if _MEMORY_OK:
+            status = "已完成" if not t.cancelled else "已取消"
+            write_event("task", "X模式", f"{status}: {t.description}\n" + "\n".join(t.results))
+
+    executor.on_step_preview  = on_preview
+    executor.on_task_complete = on_complete
+
+    ok, msg = executor.run_task(task)
+    if not ok:
+        return json.dumps({"error": msg})
+
+    return json.dumps({
+        "status":  "started",
+        "task":    description,
+        "steps":   len(task.actions),
+        "actions": [a.target for a in task.actions],
+        "hint":    "任务执行中。按 Esc 或把鼠标移到左上角可立即停止。",
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def stop_task() -> str:
+    """紧急停止 X 模式正在执行的任务。"""
+    if not _X_OK:
+        return json.dumps({"error": "X 模式未启用"})
+    executor.stop()
+    return json.dumps({"status": "stopped", "hint": "任务已停止"})
 
 
 @mcp.tool()

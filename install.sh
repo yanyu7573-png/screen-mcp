@@ -1,152 +1,139 @@
 #!/bin/bash
-# screen-mcp 安装脚本 —— macOS / Linux
+# screen-mcp 一键安装脚本
+# 用法：curl -fsSL https://raw.githubusercontent.com/yanyu7573-png/screen-mcp/main/install.sh | bash
+
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV="$SCRIPT_DIR/.venv"
-PLATFORM="$(uname -s)"
+REPO="https://github.com/yanyu7573-png/screen-mcp"
+INSTALL_DIR="$HOME/.screen-mcp-app"
 
-echo "════════════════════════════════════"
-echo "  screen-mcp 安装脚本"
-echo "  平台: $PLATFORM"
-echo "════════════════════════════════════"
+echo "============================================"
+echo "  screen-mcp 安装程序"
+echo "  让 Claude AI 实时看到你的屏幕"
+echo "============================================"
+echo ""
 
-# ── 1. 检查 Python ────────────────────────────────────────────────────────────
+# ── 检查依赖 ─────────────────────────────────────────────────────────────────
+
 if ! command -v python3 &>/dev/null; then
-    echo "[ERROR] 未找到 python3"
-    if [ "$PLATFORM" = "Darwin" ]; then
-        echo "       请安装: brew install python3"
-    else
-        echo "       请安装: sudo apt install python3 python3-venv"
-    fi
+    echo "[错误] 未找到 Python3，请先安装："
+    echo "  macOS:   brew install python3"
+    echo "  Ubuntu:  sudo apt install python3 python3-pip python3-venv"
     exit 1
 fi
-PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-echo "[✓] Python $PY_VER"
 
-# ── 2. 创建虚拟环境 ───────────────────────────────────────────────────────────
-if [ ! -d "$VENV" ]; then
-    echo "[...] 创建虚拟环境..."
-    python3 -m venv "$VENV"
+PYTHON_MINOR=$(python3 -c "import sys; print(sys.version_info.minor)")
+if [ "$PYTHON_MINOR" -lt 10 ]; then
+    echo "[错误] 需要 Python 3.10+，当前版本过低"
+    exit 1
 fi
-echo "[✓] 虚拟环境: $VENV"
 
-# ── 3. 安装 Python 依赖 ───────────────────────────────────────────────────────
-echo "[...] 安装依赖..."
-"$VENV/bin/pip" install -q --upgrade pip
-"$VENV/bin/pip" install -q "mcp[cli]>=1.0.0" Pillow
+if ! command -v git &>/dev/null; then
+    echo "[错误] 未找到 git，请先安装：brew install git"
+    exit 1
+fi
 
-# OCR（可选）
-if command -v tesseract &>/dev/null; then
-    "$VENV/bin/pip" install -q pytesseract
-    echo "[✓] Tesseract OCR 已安装并启用"
+if ! command -v claude &>/dev/null; then
+    echo "[错误] 未找到 Claude Code，请先安装："
+    echo "  https://claude.ai/code"
+    exit 1
+fi
+
+echo "[✓] 依赖检查通过"
+
+# ── 下载代码 ─────────────────────────────────────────────────────────────────
+
+if [ -d "$INSTALL_DIR/.git" ]; then
+    echo "[*] 已有安装，更新到最新版本..."
+    cd "$INSTALL_DIR" && git pull --quiet
 else
-    echo "[i] Tesseract 未安装（可选），macOS 使用 Accessibility API，无需 OCR"
-    if [ "$PLATFORM" = "Darwin" ]; then
-        echo "    如需 OCR 支持: brew install tesseract tesseract-lang"
-    else
-        echo "    如需 OCR 支持: sudo apt install tesseract-ocr tesseract-ocr-chi-sim"
-    fi
-fi
-echo "[✓] Python 依赖安装完成"
-
-# ── 4. Linux 额外工具 ─────────────────────────────────────────────────────────
-if [ "$PLATFORM" = "Linux" ]; then
-    echo "[Linux] 检查截图工具..."
-    if ! command -v scrot &>/dev/null && ! command -v gnome-screenshot &>/dev/null; then
-        echo "[!] 未找到截图工具，请安装: sudo apt install scrot"
-    else
-        echo "[✓] 截图工具已就绪"
-    fi
+    echo "[*] 下载 screen-mcp..."
+    git clone --quiet "$REPO" "$INSTALL_DIR"
+    cd "$INSTALL_DIR"
 fi
 
-# ── 5. macOS 权限提示 ─────────────────────────────────────────────────────────
-if [ "$PLATFORM" = "Darwin" ]; then
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "  [重要] macOS 需要授权屏幕录制"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "  系统设置 → 隐私与安全 → 屏幕录制"
-    echo "  添加并勾选: Terminal / iTerm2 / 你用的终端"
-    echo ""
+cd "$INSTALL_DIR"
+
+# ── 安装 Python 依赖 ─────────────────────────────────────────────────────────
+
+echo "[*] 安装依赖..."
+python3 -m venv .venv
+.venv/bin/pip install --quiet --upgrade pip
+.venv/bin/pip install --quiet "mcp[cli]" Pillow
+
+if [ -n "$ANTHROPIC_API_KEY" ]; then
+    echo "[*] 检测到 ANTHROPIC_API_KEY，安装 S 模式 AI 思考模块..."
+    .venv/bin/pip install --quiet anthropic
 fi
 
-# ── 6. 生成 Claude Desktop 配置片段 ──────────────────────────────────────────
-PYTHON_PATH="$VENV/bin/python"
-SERVER_PATH="$SCRIPT_DIR/server.py"
+echo "[✓] 依赖安装完成"
 
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  将以下配置添加到 Claude Desktop 配置文件"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-cat <<EOF
-{
-  "mcpServers": {
-    "screen-assistant": {
-      "command": "$PYTHON_PATH",
-      "args": ["$SERVER_PATH"]
-    }
-  }
-}
+# ── 注册到 Claude Code ────────────────────────────────────────────────────────
+
+echo "[*] 注册 MCP 服务器..."
+PYTHON_PATH="$INSTALL_DIR/.venv/bin/python"
+SERVER_PATH="$INSTALL_DIR/server.py"
+
+# 先删旧的再注册（防止路径变更）
+claude mcp remove screen-assistant -s user 2>/dev/null || true
+claude mcp add -s user screen-assistant "$PYTHON_PATH" -- "$SERVER_PATH"
+
+echo "[✓] MCP 注册完成"
+
+# ── 安装斜杠命令 ─────────────────────────────────────────────────────────────
+
+COMMANDS_DIR="$HOME/.claude/commands"
+mkdir -p "$COMMANDS_DIR"
+
+cat > "$COMMANDS_DIR/look.md" << 'EOF'
+调用 get_screen_context 工具查看我当前屏幕上的内容，然后直接告诉我你看到了什么，不要问我任何问题。
 EOF
-echo ""
 
-# 自动写入配置文件
-if [ "$PLATFORM" = "Darwin" ]; then
-    CONFIG_PATH="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
-elif [ "$PLATFORM" = "Linux" ]; then
-    CONFIG_PATH="$HOME/.config/claude/claude_desktop_config.json"
+cat > "$COMMANDS_DIR/monitor.md" << 'EOF'
+调用 start_live_monitor 工具开启实时屏幕监控，然后简短告诉我监控已开启、探测间隔、以及我现在可以直接问你屏幕上的任何问题。
+EOF
+
+cat > "$COMMANDS_DIR/monitor-stop.md" << 'EOF'
+调用 stop_live_monitor 工具停止实时屏幕监控，然后简短告诉我监控已停止和共记录了多少事件。
+EOF
+
+cat > "$COMMANDS_DIR/workflow.md" << 'EOF'
+调用 get_workflow_context 工具获取我的工作流全景，然后根据返回的会话叙述、今日日志、当前屏幕状态，主动告诉我：你观察到我在做什么、遇到了哪些问题、有什么建议。不要问我问题，直接给出你的分析和见解。
+EOF
+
+cat > "$COMMANDS_DIR/insight.md" << 'EOF'
+调用 get_session_timeline 工具获取本次会话的完整时间线和行为分析，然后告诉我：我今天在哪些 App 花了最多时间、主要在做什么任务、遇到了哪些错误、当前任务模式是什么。用简洁的中文总结。
+EOF
+
+echo "[✓] 斜杠命令安装完成"
+
+# ── macOS 权限提示 ────────────────────────────────────────────────────────────
+
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    echo ""
+    echo "============================================"
+    echo "  macOS 用户：需要授权屏幕录制权限"
+    echo "============================================"
+    echo "  系统设置 → 隐私与安全性 → 屏幕录制"
+    echo "  → 勾选 Terminal（或你使用的终端 App）"
 fi
 
-if [ -n "$CONFIG_PATH" ]; then
-    echo "Claude Desktop 配置文件路径:"
-    echo "  $CONFIG_PATH"
-    echo ""
-    read -p "是否自动写入配置？(y/N): " -n 1 -r
-    echo ""
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        mkdir -p "$(dirname "$CONFIG_PATH")"
-        # 如果配置文件已存在，备份
-        if [ -f "$CONFIG_PATH" ]; then
-            cp "$CONFIG_PATH" "$CONFIG_PATH.backup"
-            echo "[✓] 已备份原配置到 $CONFIG_PATH.backup"
-            # 用 python 合并 JSON（避免覆盖其他 MCP 服务器）
-            "$VENV/bin/python" -c "
-import json, os
-config_path = '$CONFIG_PATH'
-new_entry = {
-    'screen-assistant': {
-        'command': '$PYTHON_PATH',
-        'args': ['$SERVER_PATH']
-    }
-}
-with open(config_path) as f:
-    config = json.load(f)
-config.setdefault('mcpServers', {}).update(new_entry)
-with open(config_path, 'w') as f:
-    json.dump(config, f, indent=2, ensure_ascii=False)
-print('[✓] 配置已合并写入')
-"
-        else
-            cat > "$CONFIG_PATH" <<EOF2
-{
-  "mcpServers": {
-    "screen-assistant": {
-      "command": "$PYTHON_PATH",
-      "args": ["$SERVER_PATH"]
-    }
-  }
-}
-EOF2
-            echo "[✓] 配置文件已创建"
-        fi
-        echo ""
-        echo "重启 Claude Desktop 即可生效 ✓"
-    fi
-fi
+# ── 完成 ─────────────────────────────────────────────────────────────────────
 
 echo ""
-echo "════════════════════════════════════"
-echo "  安装完成！"
-echo "  测试命令: $PYTHON_PATH $SERVER_PATH"
-echo "════════════════════════════════════"
+echo "============================================"
+echo "  安装完成！重新打开 Claude Code 即可使用"
+echo "============================================"
+echo ""
+echo "  快速开始："
+echo "    /look          查看当前屏幕"
+echo "    /monitor       开启实时监控"
+echo "    /workflow      AI 分析你在做什么"
+echo "    /insight       今日使用分析"
+echo ""
+echo "  开启 S 模式（AI 主动思考）："
+echo "    export ANTHROPIC_API_KEY='sk-ant-...'"
+echo "    重新安装后在 Claude Code 说「开 S 模式」"
+echo ""
+echo "  项目地址：$REPO"
+echo ""

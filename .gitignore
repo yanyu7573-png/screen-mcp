@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+
+# 数据目录（个人日志，不上传）
+.screen-mcp/
+
+# 系统
+.DS_Store
+*.swp
